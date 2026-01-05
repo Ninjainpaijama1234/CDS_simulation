@@ -1,340 +1,450 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
-from sklearn.ensemble import RandomForestRegressor
-import warnings
 import re
+import os
+from io import StringIO
+from sklearn.linear_model import LinearRegression
 
-warnings.filterwarnings('ignore')
+# -----------------------------------------------------------------------------
+# CONSTANTS & CONFIG
+# -----------------------------------------------------------------------------
+st.set_page_config(page_title="CESIM Dashboard", layout="wide")
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="Team Green AI Dashboard", layout="wide")
-st.title("🌱 Team Green: AI Decision Engine")
+TEAMS_DEFAULT = ["Green", "Red", "Blue", "Orange", "Grey", "Ochre"]
 
-# --- PARSER FOR CESIM CSV/EXCEL ---
+# Mapping keywords to Model Types
+MODEL_MAPPING = {
+    "Sales": "linear_trend",
+    "Revenue": "linear_trend",
+    "Cost": "exp_smoothing",
+    "Expense": "exp_smoothing",
+    "R&D": "exp_smoothing",
+    "Promotion": "exp_smoothing",
+    "Profit": "linear_trend",
+    "EBIT": "linear_trend",
+    "Assets": "drift",
+    "Equity": "drift",
+    "Debt": "drift",
+    "Cash": "drift",
+    "Inventory": "drift",
+    "Ratio": "moving_average",
+    "Margin": "moving_average"
+}
+
+# -----------------------------------------------------------------------------
+# HELPER FUNCTIONS: PARSING & CLEANING
+# -----------------------------------------------------------------------------
+
+def clean_currency(val):
+    """
+    Cleans string values like "4,13,52,625" -> 41352625.0
+    Handles Indian/standard separators by stripping all non-numeric chars except '.' and '-'
+    """
+    if pd.isna(val) or val == "":
+        return 0.0
+    val_str = str(val)
+    # Remove everything that is not a digit, a minus sign, or a decimal point
+    clean_str = re.sub(r'[^\d.-]', '', val_str)
+    try:
+        return float(clean_str)
+    except ValueError:
+        return 0.0
+
+def extract_round_number(filename):
+    """Extracts round number from filename (e.g., 'results-ir01.csv' -> 1)"""
+    digits = re.findall(r'\d+', filename)
+    if digits:
+        return int(digits[-1])
+    return 0
+
 def parse_cesim_file(uploaded_file):
     """
-    Parses the specific Cesim Results CSV/Excel format.
-    Handles UTF-8, Latin-1, and Excel binary formats automatically.
-    Extracts metrics for 'Green' (Column index 1).
+    Parses a single CESIM CSV/Excel file into a tidy DataFrame.
     """
-    df = None
+    filename = uploaded_file.name
+    round_num = extract_round_number(filename)
     
-    # 1. Attempt to read file with different methods
-    try:
-        uploaded_file.seek(0)
-        df = pd.read_csv(uploaded_file, encoding='utf-8')
-    except UnicodeDecodeError:
-        try:
-            uploaded_file.seek(0)
-            df = pd.read_csv(uploaded_file, encoding='latin-1')
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-    # 2. If CSV failed, try reading as Excel (in case it's .xls/.xlsx)
-    if df is None:
-        try:
-            uploaded_file.seek(0)
-            df = pd.read_excel(uploaded_file)
-        except Exception as e:
-            st.error(f"Error parsing {uploaded_file.name}: {e}")
-            return None
-
-    try:
-        # Helper to find values safely
-        def get_value(row_label, col_index=1): # col_index 1 is Green
-            # Find row index where column 0 contains the label (case insensitive)
-            mask = df.iloc[:, 0].astype(str).str.contains(row_label, case=False, na=False)
-            rows = df[mask]
-            
-            if not rows.empty:
-                val = rows.iloc[0, col_index]
-                
-                # Robust cleaning
-                if pd.isna(val) or str(val).lower() == 'nan':
-                    return 0.0
-                
-                try:
-                    # Remove all non-numeric characters except dots and minus signs
-                    val_str = str(val)
-                    # Use regex to keep only digits, dots, and negative signs
-                    clean_val = re.sub(r'[^\d.-]', '', val_str)
-                    if clean_val == '' or clean_val == '.' or clean_val == '-':
-                        return 0.0
-                    return float(clean_val)
-                except:
-                    return 0.0
-            return 0.0
-
-        # Extract Round Number (heuristic based on filename)
-        filename = uploaded_file.name.lower()
-        round_num = 0
-        if "ir00" in filename: round_num = 0
-        elif "r01" in filename: round_num = 1
-        elif "r02" in filename: round_num = 2
-        elif "r03" in filename: round_num = 3
-        elif "r04" in filename: round_num = 4
-        elif "r05" in filename: round_num = 5
-
-        # Extract Metrics for Green
-        # Note: We assume 'Green' is at index 1 based on your previous files.
-        data = {
-            "Round": round_num,
-            "Sales Revenue": get_value("Sales revenue"),
-            "Operating Profit": get_value("Operating profit"), 
-            "Cash": get_value("Cash and cash equivalents"),
-            "Market Share": get_value("Global market shares", col_index=1),
-            
-            # Technology Specifics
-            "Price_Combustion": get_value("Selling price", col_index=1), 
-            "Features": get_value("Number of offered features", col_index=1),
-            "Promo": get_value("Promotion", col_index=1),
-            "R&D Spend": get_value("R&D", col_index=1),
-            "Capacity Usage": get_value("Capacity usage", col_index=1),
-            "Inventory": get_value("Inventory", col_index=1),
-            
-            # Costs
-            "COGS": get_value("Variable production costs", col_index=1),
-            "Logistics Cost": get_value("Transportation and tariffs", col_index=1)
-        }
-        return data
-    except Exception as e:
-        st.error(f"Error processing data in {uploaded_file.name}: {e}")
-        return None
-
-# --- SIDEBAR: DATA UPLOAD ---
-st.sidebar.header("📁 Data Management")
-uploaded_files = st.sidebar.file_uploader(
-    "Upload Result CSVs/Excel", 
-    accept_multiple_files=True,
-    type=["csv", "xls", "xlsx"]
-)
-
-history_df = pd.DataFrame()
-
-if uploaded_files:
-    data_list = []
-    for f in uploaded_files:
-        parsed_data = parse_cesim_file(f)
-        if parsed_data:
-            data_list.append(parsed_data)
-    
-    if data_list:
-        history_df = pd.DataFrame(data_list).sort_values("Round")
-        st.sidebar.success(f"Loaded {len(history_df)} rounds of data.")
+    # Read file content
+    if filename.endswith('.csv'):
+        stringio = StringIO(uploaded_file.getvalue().decode("utf-8"))
+        # Read without header initially to parse blocks manually
+        raw_df = pd.read_csv(stringio, header=None)
     else:
-        st.sidebar.warning("Could not parse uploaded files.")
-else:
-    st.sidebar.info("Upload files to enable analytics. Using default initialization.")
+        # Excel fallback
+        raw_df = pd.read_excel(uploaded_file, header=None)
 
-# --- ML ENGINE ---
-@st.cache_resource
-def train_model(history):
-    """
-    Trains a model using real history + synthetic data for stability.
-    """
-    # 1. Base params
-    if not history.empty:
-        # Fill any missing values in history with sensible defaults to prevent crashes
-        safe_history = history.fillna(0)
-        
-        base_price = safe_history["Price_Combustion"].mean()
-        if base_price == 0: base_price = 20000
-        
-        base_features = safe_history["Features"].mean()
-        if base_features == 0: base_features = 3
-        
-        base_share = safe_history["Market Share"].mean()
-        if base_share == 0: base_share = 16.0
-    else:
-        base_price = 20000
-        base_features = 3
-        base_share = 16.0
-
-    # 2. Generate Synthetic Training Data
-    np.random.seed(42)
-    N = 500
+    parsed_data = []
     
-    prices = np.random.normal(base_price, 3000, N)
-    features = np.random.randint(1, 10, N)
-    promo = np.random.normal(1500000, 500000, N) # kUSD
+    current_scope = "Unknown"
+    current_statement = "Unknown"
+    current_teams = []
+    in_block = False
     
-    # Normalized factors for synthetic demand curve
-    p_norm = 1 - (prices / 30000) 
-    f_norm = features / 10
-    pr_norm = promo / 3000000
-    
-    est_share = (p_norm * 0.5 + f_norm * 0.3 + pr_norm * 0.2) * 40 
-    est_share += np.random.normal(0, 2, N)
-    est_share = np.clip(est_share, 5, 50)
-
-    # 3. Combine with Real History
-    X_syn = pd.DataFrame({'Price': prices, 'Features': features, 'Promo': promo})
-    y_syn = est_share
-    
-    if not history.empty:
-        # Select relevant columns and Drop NaNs to ensure clean training data
-        cols = ['Price_Combustion', 'Features', 'Promo', 'Market Share']
+    # Iterate row by row to detect blocks
+    for idx, row in raw_df.iterrows():
+        first_col = str(row[0]).strip()
         
-        # Check if columns exist
-        if set(cols).issubset(history.columns):
-            # Create a clean dataframe for training
-            training_data = history[cols].copy()
-            training_data.columns = ['Price', 'Features', 'Promo', 'Target']
+        # Detect Header Block (e.g., "Income statement, k USD, Global")
+        if "Income statement" in first_col or "Balance sheet" in first_col:
+            parts = [p.strip() for p in first_col.split(',')]
+            # Usually: [Type, Unit, Scope]
+            current_statement = parts[0] if len(parts) > 0 else "Unknown"
+            current_scope = parts[-1] if len(parts) > 1 else "Global"
+            in_block = True
+            # The NEXT row usually contains team names, handled by logic below
+            continue
             
-            # Drop rows where any value is NaN or 0 (assuming Price=0 is invalid)
-            training_data = training_data.dropna()
-            training_data = training_data[training_data['Price'] > 100] # Basic sanity check
+        if in_block:
+            # Check if this row is the Team Header row
+            # Team header rows typically start with an empty cell or match known team names
+            row_values = [str(x).strip() for x in row.values]
             
-            if not training_data.empty:
-                X_real = training_data[['Price', 'Features', 'Promo']]
-                y_real = training_data['Target']
+            # Heuristic: verify if intersection with known teams exists or if col 1 is empty/null 
+            # and col 2 is a potential team name
+            potential_teams = row_values[1:]
+            
+            # If we find standard team names in this row, treat it as header
+            if any(t in TEAMS_DEFAULT for t in potential_teams):
+                current_teams = potential_teams
+                continue
+            
+            # If first column is empty, it might be a spacer or header, skip
+            if not first_col or first_col == "nan":
+                continue
                 
-                # Weight real data heavily (50x duplication)
-                X_train = pd.concat([X_syn] + [X_real]*50, ignore_index=True)
-                y_train = np.concatenate([y_syn, np.tile(y_real, 50)])
-            else:
-                X_train, y_train = X_syn, y_syn
+            # Otherwise, it's a Data Row (Metric + Values)
+            metric_name = first_col
+            
+            # Safety: Ensure we have teams to map to
+            if not current_teams:
+                continue
+                
+            for col_idx, team_name in enumerate(current_teams):
+                # Data values start at index 1 (index 0 is metric name)
+                if col_idx + 1 < len(row):
+                    raw_val = row[col_idx + 1]
+                    val = clean_currency(raw_val)
+                    
+                    # Store tidy record
+                    if team_name and team_name != "nan": # filter empty cols
+                        parsed_data.append({
+                            "round": round_num,
+                            "scope": current_scope,
+                            "statement_type": current_statement,
+                            "metric": metric_name,
+                            "team": team_name,
+                            "value_k_usd": val
+                        })
+
+    return pd.DataFrame(parsed_data)
+
+# -----------------------------------------------------------------------------
+# HELPER FUNCTIONS: ANALYTICS & FORECAST
+# -----------------------------------------------------------------------------
+
+def compute_derived_metrics(df):
+    """
+    Adds calculated rows (Gross Profit, Ratios) to the DataFrame.
+    Note: Ideally handled by pivoting, calculating, and melting back, 
+    but for simplicity, we compute on the fly in the UI or here.
+    """
+    # For this dashboard, we will compute derived metrics dynamically 
+    # in the Overview tab to avoid complex DataFrame manipulation here.
+    return df
+
+def get_default_model(metric_name):
+    """Determine default forecast model based on metric keywords."""
+    for key, model in MODEL_MAPPING.items():
+        if key.lower() in metric_name.lower():
+            return model
+    return "naive"
+
+def forecast_series(series, model_type="auto", horizon=3):
+    """
+    Generates a forecast for a pandas Series (indexed by round).
+    series: pd.Series (index=round, value=float)
+    returns: (pd.Series[historical], pd.Series[forecast])
+    """
+    if series.empty:
+        return series, pd.Series()
+
+    # Sort index to be sure
+    series = series.sort_index()
+    last_round = series.index.max()
+    future_rounds = np.arange(last_round + 1, last_round + 1 + horizon)
+    
+    # Auto-selection logic handled before call, but fallback here
+    if model_type == "auto":
+        model_type = "naive"
+
+    predictions = []
+
+    if model_type == "naive":
+        # Last value carried forward
+        last_val = series.iloc[-1]
+        predictions = [last_val] * horizon
+
+    elif model_type == "moving_average":
+        # Average of last 3 rounds (or length of series)
+        window = min(len(series), 3)
+        avg = series.tail(window).mean()
+        predictions = [avg] * horizon
+
+    elif model_type == "linear_trend":
+        if len(series) > 1:
+            X = np.array(series.index).reshape(-1, 1)
+            y = series.values
+            model = LinearRegression()
+            model.fit(X, y)
+            X_future = future_rounds.reshape(-1, 1)
+            pred_vals = model.predict(X_future)
+            predictions = pred_vals
         else:
-             X_train, y_train = X_syn, y_syn
+            # Fallback to naive if not enough points
+            predictions = [series.iloc[-1]] * horizon
+
+    elif model_type == "exp_smoothing":
+        # Simple implementation: Level_t = alpha * x_t + (1-alpha) * Level_{t-1}
+        # With trend component simplified
+        values = series.values
+        if len(values) < 2:
+            predictions = [values[-1]] * horizon
+        else:
+            # Calculate simple geometric growth rate or just smooth
+            # Use simple weighted average of recent vs old
+            alpha = 0.5
+            level = values[0]
+            for v in values[1:]:
+                level = alpha * v + (1 - alpha) * level
+            # Project level flatly (Conservative for costs)
+            predictions = [level] * horizon
+
+    elif model_type == "drift":
+        # Random Walk with Drift: Last + Average Change
+        if len(series) > 1:
+            diffs = series.diff().dropna()
+            avg_drift = diffs.mean()
+            last_val = series.iloc[-1]
+            predictions = [last_val + avg_drift * (i + 1) for i in range(horizon)]
+        else:
+            predictions = [series.iloc[-1]] * horizon
+
     else:
-        X_train, y_train = X_syn, y_syn
+        predictions = [series.iloc[-1]] * horizon
 
-    model = RandomForestRegressor(n_estimators=100)
-    model.fit(X_train, y_train)
-    return model
+    forecast_series = pd.Series(predictions, index=future_rounds)
+    return series, forecast_series
 
-# Train Model
-model = train_model(history_df)
+# -----------------------------------------------------------------------------
+# MAIN APP UI
+# -----------------------------------------------------------------------------
 
-# --- DASHBOARD TABS ---
-tab1, tab2, tab3 = st.tabs(["📊 Historical Performance", "🤖 Decision Simulation", "💡 Strategic Insights"])
-
-# --- TAB 1: HISTORY ---
-with tab1:
-    if not history_df.empty:
-        col1, col2, col3, col4 = st.columns(4)
-        last_round = history_df.iloc[-1]
-        
-        col1.metric("Last Sales Rev", f"${last_round['Sales Revenue']:,.0f}")
-        col2.metric("Cash on Hand", f"${last_round['Cash']:,.0f}")
-        col3.metric("Market Share", f"{last_round['Market Share']:.1f}%")
-        col4.metric("Op. Profit", f"${last_round['Operating Profit']:,.0f}")
-        
-        # Charts
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("Revenue & Profit Trend")
-            if len(history_df) > 1:
-                fig = px.line(history_df, x="Round", y=["Sales Revenue", "Operating Profit"], markers=True)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Upload more round data to see trends over time.")
-        with c2:
-            st.subheader("Market Share Trend")
-            if len(history_df) > 0:
-                fig = px.bar(history_df, x="Round", y="Market Share", color_discrete_sequence=['#00CC00'])
-                st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Upload data to see historical trends.")
-
-# --- TAB 2: SIMULATION ---
-with tab2:
-    st.subheader("Predictive Decision Optimizer")
+def main():
+    st.sidebar.title("CESIM Dashboard")
     
-    # Set defaults safely
-    if not history_df.empty:
-        # Use last round's data as defaults, but check if they are valid (>0)
-        last = history_df.iloc[-1]
-        def_price = float(last['Price_Combustion']) if last['Price_Combustion'] > 0 else 20000.0
-        def_feat = int(last['Features']) if last['Features'] > 0 else 3
-        def_promo = float(last['Promo']) if last['Promo'] > 0 else 1000000.0
-        
-        # Estimate capacity based on usage
-        def_cap = 2000.0 # Fallback default
-        if last['Capacity Usage'] > 0:
-             # Heuristic: If we used 80% capacity to make 1600 units, total cap is ~2000
-             # We don't have exact units produced, so we use a safe default or user input
-             pass
-    else:
-        def_price = 20000.0
-        def_feat = 3
-        def_promo = 1500000.0
-        def_cap = 2000.0
+    # 1. FILE UPLOAD
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload Round Results", 
+        type=['csv', 'xlsx'], 
+        accept_multiple_files=True
+    )
 
-    # Input Form
-    with st.form("sim_inputs"):
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            p_price = st.number_input("Selling Price ($)", value=def_price, step=500.0)
-            p_prod = st.number_input("Planned Production (k units)", value=1000.0)
-        with col_b:
-            p_feat = st.slider("Features (1-10)", 1, 10, def_feat)
-            p_cap = st.number_input("Total Capacity (k units)", value=def_cap)
-        with col_c:
-            p_promo = st.number_input("Promotion Budget ($)", value=def_promo, step=100000.0)
-            p_rnd = st.number_input("R&D Investment ($)", value=500000.0)
-            
-        submitted = st.form_submit_button("🚀 Run Monte Carlo Simulation")
+    if not uploaded_files:
+        st.info("Please upload 'results-irXX.csv' files to begin.")
+        st.markdown("""
+        **Expected Format:**
+        * CSV files with block headers (e.g., "Income statement, k USD, Global").
+        * Team names in columns.
+        * Filenames should contain round number (e.g., `results-ir01.csv`).
+        """)
+        return
 
-    if submitted:
-        # 1. Predict Market Share
-        pred_share = model.predict([[p_price, p_feat, p_promo]])[0]
-        
-        # 2. Monte Carlo
-        scenarios = []
-        for _ in range(500):
-            # Uncertainties
-            u_share = np.random.normal(pred_share, 2.0) # +/- 2% share volatility
-            u_market_growth = np.random.normal(1.10, 0.05) # 10% growth +/- 5%
-            
-            # Calculations
-            # Assume base market size ~10,000k units (simplified for demo)
-            market_size = 10000 * u_market_growth 
-            demand = market_size * (u_share / 100.0) * 0.16 # Assuming 6 teams
-            
-            sales = min(demand, p_prod)
-            revenue = sales * p_price
-            
-            # Costs
-            # U-shaped curve logic: optimal utilization is 90%
-            util = p_prod / p_cap if p_cap > 0 else 0
-            cost_mult = 1.0 + (abs(0.9 - util) * 0.5) # Penalty for deviation
-            base_var_cost = 15000 # Placeholder base cost
-            cogs = sales * base_var_cost * cost_mult
-            
-            # Fixed
-            opex = p_promo + p_rnd + 2000000 # Base admin
-            
-            profit = revenue - cogs - opex
-            scenarios.append(profit)
-            
-        # 3. Results
-        profits = np.array(scenarios)
-        mean_profit = profits.mean()
-        var_95 = np.percentile(profits, 5)
-        
-        r1, r2, r3 = st.columns(3)
-        r1.metric("Predicted Market Share", f"{pred_share:.2f}%")
-        r2.metric("Expected Profit", f"${mean_profit:,.0f}")
-        r3.metric("Risk (VaR 95%)", f"${var_95:,.0f}", delta_color="inverse")
-        
-        # Histogram
-        fig_hist = px.histogram(x=profits, nbins=30, title="Profit Distribution (500 Scenarios)",
-                               labels={'x': 'Profit ($)'}, color_discrete_sequence=['green'])
-        fig_hist.add_vline(x=mean_profit, line_dash="dash", line_color="black", annotation_text="Mean")
-        fig_hist.add_vline(x=var_95, line_dash="dash", line_color="red", annotation_text="Risk Floor")
-        st.plotly_chart(fig_hist, use_container_width=True)
+    # 2. PARSE & COMBINE
+    all_data = []
+    with st.spinner("Parsing files..."):
+        for f in uploaded_files:
+            try:
+                df_round = parse_cesim_file(f)
+                all_data.append(df_round)
+            except Exception as e:
+                st.error(f"Error parsing {f.name}: {e}")
+    
+    if not all_data:
+        st.error("No valid data found.")
+        return
 
-# --- TAB 3: INSIGHTS ---
-with tab3:
-    st.subheader("Nuanced Strategy Guide")
-    st.markdown("""
-    **Optimization Checklist:**
-    1.  **Capacity:** Check 'Capacity Usage' in History. If <80% or >100%, adjust 'Planned Production'.
-    2.  **Cash:** Ensure `Cash > $2,000,000` to avoid emergency debt.
-    3.  **Features vs. Cost:** Increasing features boosts demand but increases R&D and Variable Costs. Use the simulator to find if the extra demand pays for the cost.
-    """)
+    df_full = pd.concat(all_data, ignore_index=True)
+    df_full = df_full.sort_values(by="round")
+    
+    # Global Filters
+    st.sidebar.markdown("---")
+    st.sidebar.header("Filters")
+    
+    available_teams = sorted(df_full['team'].unique())
+    available_scopes = sorted(df_full['scope'].unique())
+    available_rounds = sorted(df_full['round'].unique())
+    
+    selected_team = st.sidebar.selectbox("Select Team", available_teams, index=0)
+    selected_scope = st.sidebar.selectbox("Select Scope", available_scopes, index=0)
+    
+    # Get latest round data for Summary
+    max_round = max(available_rounds)
+    
+    # TABS
+    tab_overview, tab_explorer, tab_prediction = st.tabs(["Overview", "Variable Explorer", "Prediction"])
+
+    # --- TAB 1: OVERVIEW ---
+    with tab_overview:
+        st.header(f"Overview: {selected_team} ({selected_scope}) - Round {max_round}")
+        
+        # Filter Data
+        df_curr = df_full[
+            (df_full['round'] == max_round) & 
+            (df_full['team'] == selected_team) & 
+            (df_full['scope'] == selected_scope)
+        ].set_index('metric')['value_k_usd']
+
+        # Helper to safely get value
+        def get_val(metric_part, default=0):
+            # Fuzzy match metric name
+            matches = [k for k in df_curr.index if metric_part.lower() in k.lower()]
+            if matches:
+                # Prioritize exact start match or shortest match
+                return df_curr[matches[0]]
+            return default
+
+        # KPIs
+        sales = get_val("Sales revenue")
+        profit = get_val("Profit for the round")
+        assets = get_val("Total assets")
+        equity = get_val("Shareholder's equity") # Common name in CESIM, usually "Shareholder's equity" or just "Total equity"
+        if equity == 0: equity = get_val("Total equity")
+        
+        # Calculations
+        ebit = get_val("Operating profit")
+        if ebit == 0: ebit = get_val("EBIT")
+        
+        net_margin = (profit / sales * 100) if sales else 0
+        equity_ratio = (equity / assets * 100) if assets else 0
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Sales Revenue", f"${sales:,.0f}k")
+        col2.metric("Net Profit", f"${profit:,.0f}k", f"{net_margin:.1f}% Margin")
+        col3.metric("Total Assets", f"${assets:,.0f}k")
+        col4.metric("Equity Ratio", f"{equity_ratio:.1f}%")
+
+        st.subheader("Cost Breakdown")
+        # Identify cost metrics
+        cost_metrics = [
+            "In-house manufacturing", "Feature costs", "Contract manufacturing", 
+            "Transportation", "R&D", "Promotion", "Warranty", "Administration"
+        ]
+        
+        cost_data = {}
+        for cm in cost_metrics:
+            val = get_val(cm)
+            if val > 0:
+                cost_data[cm] = val
+        
+        if cost_data:
+            df_costs = pd.DataFrame(list(cost_data.items()), columns=['Cost Item', 'Amount'])
+            df_costs['% of Sales'] = (df_costs['Amount'] / sales * 100) if sales else 0
+            
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                st.bar_chart(df_costs.set_index('Cost Item')['Amount'])
+            with c2:
+                st.dataframe(df_costs.style.format({'Amount': '{:,.0f}', '% of Sales': '{:.1f}%'}))
+        else:
+            st.info("No detailed cost data found for this scope.")
+
+    # --- TAB 2: VARIABLE EXPLORER ---
+    with tab_explorer:
+        st.header("Variable Explorer")
+        
+        # Dropdown for metric
+        all_metrics = sorted(df_full['metric'].unique())
+        selected_metric = st.selectbox("Select Metric", all_metrics)
+        
+        # Prepare Time Series Data
+        df_ts = df_full[
+            (df_full['team'] == selected_team) & 
+            (df_full['scope'] == selected_scope) & 
+            (df_full['metric'] == selected_metric)
+        ].sort_values(by='round')
+        
+        if not df_ts.empty:
+            col_a, col_b = st.columns([3, 1])
+            
+            with col_a:
+                st.subheader(f"History: {selected_metric}")
+                st.line_chart(df_ts.set_index('round')['value_k_usd'])
+            
+            with col_b:
+                st.subheader("Values")
+                st.dataframe(df_ts[['round', 'value_k_usd']].style.format("{:,.0f}"))
+                
+                # Compare to Total Sales (if it's not sales itself)
+                if "Sales" not in selected_metric:
+                    # Get sales for the same rounds
+                    df_sales = df_full[
+                        (df_full['team'] == selected_team) & 
+                        (df_full['scope'] == selected_scope) & 
+                        (df_full['metric'].str.contains("Sales revenue"))
+                    ]
+                    if not df_sales.empty:
+                        # Merge to calc %
+                        merged = pd.merge(df_ts, df_sales, on='round', suffixes=('_item', '_sales'))
+                        merged['% of Sales'] = merged['value_k_usd_item'] / merged['value_k_usd_sales'] * 100
+                        st.write("vs Sales Revenue:")
+                        st.dataframe(merged[['round', '% of Sales']].style.format("{:.2f}%"))
+
+    # --- TAB 3: PREDICTION ---
+    with tab_prediction:
+        st.header("Forecast Engine")
+        
+        col_p1, col_p2, col_p3 = st.columns(3)
+        pred_metric = col_p1.selectbox("Metric to Forecast", all_metrics, index=0)
+        
+        default_model = get_default_model(pred_metric)
+        model_options = ["naive", "moving_average", "linear_trend", "exp_smoothing", "drift"]
+        
+        pred_model = col_p2.selectbox(
+            "Model Type", 
+            model_options, 
+            index=model_options.index(default_model) if default_model in model_options else 0
+        )
+        
+        horizon = col_p3.slider("Forecast Horizon (Rounds)", 1, 5, 3)
+        
+        # Get Data
+        df_hist = df_full[
+            (df_full['team'] == selected_team) & 
+            (df_full['scope'] == selected_scope) & 
+            (df_full['metric'] == pred_metric)
+        ].set_index('round')['value_k_usd']
+        
+        if not df_hist.empty:
+            hist_series, forecast_series = forecast_series(df_hist, pred_model, horizon)
+            
+            # Combine for plotting
+            combined_df = pd.DataFrame({
+                "Historical": hist_series,
+                "Forecast": forecast_series
+            })
+            
+            st.subheader(f"Projection: {pred_metric}")
+            st.line_chart(combined_df)
+            
+            st.write(f"**Forecast Values ({pred_model}):**")
+            st.dataframe(forecast_series.to_frame(name="Forecast Value").style.format("{:,.0f}"))
+            
+            st.markdown("""
+            *Note: Simple statistical models used. Linear Trend assumes constant growth. Exponential Smoothing weighs recent data more heavily. Drift assumes the trend continues at the average historical rate.*
+            """)
+        else:
+            st.warning("Insufficient data for forecasting.")
+
+if __name__ == "__main__":
+    main()
