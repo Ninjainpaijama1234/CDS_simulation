@@ -4,6 +4,7 @@ import numpy as np
 import plotly.express as px
 from sklearn.ensemble import RandomForestRegressor
 import warnings
+import re
 
 warnings.filterwarnings('ignore')
 
@@ -11,48 +12,84 @@ warnings.filterwarnings('ignore')
 st.set_page_config(page_title="Team Green AI Dashboard", layout="wide")
 st.title("🌱 Team Green: AI Decision Engine")
 
-# --- PARSER FOR CESIM CSV ---
+# --- PARSER FOR CESIM CSV/EXCEL ---
 def parse_cesim_file(uploaded_file):
     """
-    Parses the specific Cesim Results CSV format.
+    Parses the specific Cesim Results CSV/Excel format.
+    Handles UTF-8, Latin-1, and Excel binary formats automatically.
     Extracts metrics for 'Green' (Column index 1).
     """
+    df = None
+    
+    # 1. Attempt to read file with different methods
     try:
-        # Read file
-        df = pd.read_csv(uploaded_file)
-        
-        # Helper to find values
+        uploaded_file.seek(0)
+        df = pd.read_csv(uploaded_file, encoding='utf-8')
+    except UnicodeDecodeError:
+        try:
+            uploaded_file.seek(0)
+            df = pd.read_csv(uploaded_file, encoding='latin-1')
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # 2. If CSV failed, try reading as Excel (in case it's .xls/.xlsx)
+    if df is None:
+        try:
+            uploaded_file.seek(0)
+            df = pd.read_excel(uploaded_file)
+        except Exception as e:
+            st.error(f"Error parsing {uploaded_file.name}: {e}")
+            return None
+
+    try:
+        # Helper to find values safely
         def get_value(row_label, col_index=1): # col_index 1 is Green
             # Find row index where column 0 contains the label (case insensitive)
-            rows = df[df.iloc[:, 0].astype(str).str.contains(row_label, case=False, na=False)]
+            mask = df.iloc[:, 0].astype(str).str.contains(row_label, case=False, na=False)
+            rows = df[mask]
+            
             if not rows.empty:
                 val = rows.iloc[0, col_index]
-                # Clean value (remove spaces, convert to float)
+                
+                # Robust cleaning
+                if pd.isna(val) or str(val).lower() == 'nan':
+                    return 0.0
+                
                 try:
-                    return float(str(val).replace(' ', '').replace(',', ''))
+                    # Remove all non-numeric characters except dots and minus signs
+                    val_str = str(val)
+                    # Use regex to keep only digits, dots, and negative signs
+                    clean_val = re.sub(r'[^\d.-]', '', val_str)
+                    if clean_val == '' or clean_val == '.' or clean_val == '-':
+                        return 0.0
+                    return float(clean_val)
                 except:
                     return 0.0
             return 0.0
 
-        # Extract Round Number (from filename or content)
-        filename = uploaded_file.name
+        # Extract Round Number (heuristic based on filename)
+        filename = uploaded_file.name.lower()
+        round_num = 0
         if "ir00" in filename: round_num = 0
         elif "r01" in filename: round_num = 1
         elif "r02" in filename: round_num = 2
         elif "r03" in filename: round_num = 3
         elif "r04" in filename: round_num = 4
-        else: round_num = 0
+        elif "r05" in filename: round_num = 5
 
         # Extract Metrics for Green
+        # Note: We assume 'Green' is at index 1 based on your previous files.
         data = {
             "Round": round_num,
             "Sales Revenue": get_value("Sales revenue"),
-            "Operating Profit": get_value("Operating profit \(EBIT\)", col_index=1),
+            "Operating Profit": get_value("Operating profit"), 
             "Cash": get_value("Cash and cash equivalents"),
             "Market Share": get_value("Global market shares", col_index=1),
             
-            # Technology Specifics (Assuming Combustion/Hybrid are main drivers in early rounds)
-            "Price_Combustion": get_value("Selling price", col_index=1), # Heuristic: takes first found
+            # Technology Specifics
+            "Price_Combustion": get_value("Selling price", col_index=1), 
             "Features": get_value("Number of offered features", col_index=1),
             "Promo": get_value("Promotion", col_index=1),
             "R&D Spend": get_value("R&D", col_index=1),
@@ -65,15 +102,15 @@ def parse_cesim_file(uploaded_file):
         }
         return data
     except Exception as e:
-        st.error(f"Error parsing {uploaded_file.name}: {e}")
+        st.error(f"Error processing data in {uploaded_file.name}: {e}")
         return None
 
 # --- SIDEBAR: DATA UPLOAD ---
 st.sidebar.header("📁 Data Management")
 uploaded_files = st.sidebar.file_uploader(
-    "Upload Result CSVs (e.g., results-ir00.csv)", 
+    "Upload Result CSVs/Excel", 
     accept_multiple_files=True,
-    type=["csv", "xls"]
+    type=["csv", "xls", "xlsx"]
 )
 
 history_df = pd.DataFrame()
@@ -97,21 +134,27 @@ else:
 @st.cache_resource
 def train_model(history):
     """
-    Trains a model. If history is small (<4 rounds), creates synthetic data 
-    based on the *actual* historical averages to bootstrap the model.
+    Trains a model using real history + synthetic data for stability.
     """
-    # 1. Base params on history (or defaults if empty)
+    # 1. Base params
     if not history.empty:
-        base_price = history["Price_Combustion"].mean()
-        base_features = history["Features"].mean()
-        base_share = history["Market Share"].mean()
+        # Fill any missing values in history with sensible defaults to prevent crashes
+        safe_history = history.fillna(0)
+        
+        base_price = safe_history["Price_Combustion"].mean()
+        if base_price == 0: base_price = 20000
+        
+        base_features = safe_history["Features"].mean()
+        if base_features == 0: base_features = 3
+        
+        base_share = safe_history["Market Share"].mean()
+        if base_share == 0: base_share = 16.0
     else:
-        base_price = 18500
+        base_price = 20000
         base_features = 3
         base_share = 16.0
 
-    # 2. Generate Synthetic Training Data (to fill gaps in logic)
-    # We create 500 scenarios around the user's actual data points
+    # 2. Generate Synthetic Training Data
     np.random.seed(42)
     N = 500
     
@@ -119,38 +162,44 @@ def train_model(history):
     features = np.random.randint(1, 10, N)
     promo = np.random.normal(1500000, 500000, N) # kUSD
     
-    # Heuristic Logic for Synthetic Labels (Demand curve)
-    # Lower price + More Features + Higher Promo = Higher Share
-    # We calibrate this so the mean matches the user's historical share
-    
-    # Normalized factors
+    # Normalized factors for synthetic demand curve
     p_norm = 1 - (prices / 30000) 
     f_norm = features / 10
     pr_norm = promo / 3000000
     
     est_share = (p_norm * 0.5 + f_norm * 0.3 + pr_norm * 0.2) * 40 
-    # Add noise
     est_share += np.random.normal(0, 2, N)
     est_share = np.clip(est_share, 5, 50)
 
-    # 3. Combine with Real History (Weighted higher)
+    # 3. Combine with Real History
     X_syn = pd.DataFrame({'Price': prices, 'Features': features, 'Promo': promo})
     y_syn = est_share
     
     if not history.empty:
-        # Replicate real history to give it weight
-        X_real = history[['Price_Combustion', 'Features', 'Promo']].replace(0, np.nan).dropna()
-        # If we have valid real data
-        if not X_real.empty:
-            X_real.columns = ['Price', 'Features', 'Promo']
-            # Assume Market Share is the target
-            y_real = history.loc[X_real.index, 'Market Share']
+        # Select relevant columns and Drop NaNs to ensure clean training data
+        cols = ['Price_Combustion', 'Features', 'Promo', 'Market Share']
+        
+        # Check if columns exist
+        if set(cols).issubset(history.columns):
+            # Create a clean dataframe for training
+            training_data = history[cols].copy()
+            training_data.columns = ['Price', 'Features', 'Promo', 'Target']
             
-            # Upsample real data 50x
-            X_train = pd.concat([X_syn] + [X_real]*50, ignore_index=True)
-            y_train = np.concatenate([y_syn, np.tile(y_real, 50)])
+            # Drop rows where any value is NaN or 0 (assuming Price=0 is invalid)
+            training_data = training_data.dropna()
+            training_data = training_data[training_data['Price'] > 100] # Basic sanity check
+            
+            if not training_data.empty:
+                X_real = training_data[['Price', 'Features', 'Promo']]
+                y_real = training_data['Target']
+                
+                # Weight real data heavily (50x duplication)
+                X_train = pd.concat([X_syn] + [X_real]*50, ignore_index=True)
+                y_train = np.concatenate([y_syn, np.tile(y_real, 50)])
+            else:
+                X_train, y_train = X_syn, y_syn
         else:
-            X_train, y_train = X_syn, y_syn
+             X_train, y_train = X_syn, y_syn
     else:
         X_train, y_train = X_syn, y_syn
 
@@ -179,12 +228,16 @@ with tab1:
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("Revenue & Profit Trend")
-            fig = px.line(history_df, x="Round", y=["Sales Revenue", "Operating Profit"], markers=True)
-            st.plotly_chart(fig, use_container_width=True)
+            if len(history_df) > 1:
+                fig = px.line(history_df, x="Round", y=["Sales Revenue", "Operating Profit"], markers=True)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Upload more round data to see trends over time.")
         with c2:
             st.subheader("Market Share Trend")
-            fig = px.bar(history_df, x="Round", y="Market Share", color_discrete_sequence=['#00CC00'])
-            st.plotly_chart(fig, use_container_width=True)
+            if len(history_df) > 0:
+                fig = px.bar(history_df, x="Round", y="Market Share", color_discrete_sequence=['#00CC00'])
+                st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("Upload data to see historical trends.")
 
@@ -192,11 +245,25 @@ with tab1:
 with tab2:
     st.subheader("Predictive Decision Optimizer")
     
-    # Defaults from last round or generic
-    def_price = float(history_df['Price_Combustion'].iloc[-1]) if not history_df.empty else 20000.0
-    def_feat = int(history_df['Features'].iloc[-1]) if not history_df.empty else 3
-    def_promo = float(history_df['Promo'].iloc[-1]) if not history_df.empty else 1600000.0
-    def_cap = float(history_df['Capacity Usage'].iloc[-1]/0.7) if not history_df.empty and history_df['Capacity Usage'].iloc[-1]>0 else 2000.0 # Estimate total cap
+    # Set defaults safely
+    if not history_df.empty:
+        # Use last round's data as defaults, but check if they are valid (>0)
+        last = history_df.iloc[-1]
+        def_price = float(last['Price_Combustion']) if last['Price_Combustion'] > 0 else 20000.0
+        def_feat = int(last['Features']) if last['Features'] > 0 else 3
+        def_promo = float(last['Promo']) if last['Promo'] > 0 else 1000000.0
+        
+        # Estimate capacity based on usage
+        def_cap = 2000.0 # Fallback default
+        if last['Capacity Usage'] > 0:
+             # Heuristic: If we used 80% capacity to make 1600 units, total cap is ~2000
+             # We don't have exact units produced, so we use a safe default or user input
+             pass
+    else:
+        def_price = 20000.0
+        def_feat = 3
+        def_promo = 1500000.0
+        def_cap = 2000.0
 
     # Input Form
     with st.form("sim_inputs"):
@@ -227,7 +294,7 @@ with tab2:
             # Calculations
             # Assume base market size ~10,000k units (simplified for demo)
             market_size = 10000 * u_market_growth 
-            demand = market_size * (u_share / 100.0) * 0.16 # Assuming 6 teams, roughly 1/6th if balanced
+            demand = market_size * (u_share / 100.0) * 0.16 # Assuming 6 teams
             
             sales = min(demand, p_prod)
             revenue = sales * p_price
@@ -266,10 +333,8 @@ with tab2:
 with tab3:
     st.subheader("Nuanced Strategy Guide")
     st.markdown("""
-    Based on the uploaded data and simulation rules:
-    
-    1.  **Capacity vs. Demand:** Your utilization logic penalizes you heavily if you produce <60% or >100% of capacity. Use the simulation to find the "Sweet Spot" (usually ~90%).
-    2.  **R&D Lag:** Remember, money spent on **In-House R&D** takes 1 round to effect sales. **Licenses** are immediate but expensive.
-    3.  **Tariffs:** If you produce in USA and sell in China, verify the current tariff rate in the market report. The simulation currently assumes local production for simplicity; ensure you add logistics costs if exporting.
-    4.  **Cash Constraints:** Always keep >$2M cash. The "Risk (VaR)" metric in the simulation helps you see if a bad market turn will bankrupt you.
+    **Optimization Checklist:**
+    1.  **Capacity:** Check 'Capacity Usage' in History. If <80% or >100%, adjust 'Planned Production'.
+    2.  **Cash:** Ensure `Cash > $2,000,000` to avoid emergency debt.
+    3.  **Features vs. Cost:** Increasing features boosts demand but increases R&D and Variable Costs. Use the simulator to find if the extra demand pays for the cost.
     """)
