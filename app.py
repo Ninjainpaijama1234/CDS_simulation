@@ -416,45 +416,50 @@ def main():
     with tab_explorer:
         st.header("Variable Analysis")
         
-        # Dropdown to pick ANY metric present in the data
-        all_metrics_available = sorted(df['metric'].unique())
-        selected_metric = st.selectbox("Select Metric to Analyze", all_metrics_available)
-        
-        # Filter history
-        df_hist = df[
+        # Filter metrics relevant to the current selection to prevent empty data
+        df_scope_specific = df[
             (df['team'] == selected_team) & 
-            (df['scope'] == selected_scope) & 
-            (df['metric'] == selected_metric)
-        ].sort_values(by="round")
+            (df['scope'] == selected_scope)
+        ]
         
-        if df_hist.empty:
-            st.warning("No historical data for this metric.")
+        available_metrics = sorted(df_scope_specific['metric'].unique())
+        
+        if not available_metrics:
+            st.warning(f"No metrics found for {selected_team} in {selected_scope}. Please check your filters.")
         else:
-            col_left, col_right = st.columns([3, 1])
+            selected_metric = st.selectbox("Select Metric to Analyze", available_metrics)
             
-            with col_left:
-                st.subheader(f"Trend: {selected_metric}")
-                st.line_chart(df_hist.set_index("round")["value_k_usd"])
+            # Filter history
+            df_hist = df_scope_specific[
+                df_scope_specific['metric'] == selected_metric
+            ].sort_values(by="round")
             
-            with col_right:
-                st.subheader("Data Points")
-                st.dataframe(df_hist[["round", "value_k_usd"]].style.format("{:,.0f}"))
+            if df_hist.empty:
+                st.warning("No historical data for this metric.")
+            else:
+                col_left, col_right = st.columns([3, 1])
                 
-                # Compare to Sales (if appropriate)
-                if "Sales" not in selected_metric:
-                    # Fetch sales for same rounds
-                    df_sales = df[
-                        (df['team'] == selected_team) & 
-                        (df['scope'] == selected_scope) & 
-                        (df['metric'].str.contains("Sales revenue"))
-                    ]
+                with col_left:
+                    st.subheader(f"Trend: {selected_metric}")
+                    st.line_chart(df_hist.set_index("round")["value_k_usd"])
+                
+                with col_right:
+                    st.subheader("Data Points")
+                    st.dataframe(df_hist[["round", "value_k_usd"]].style.format("{:,.0f}"))
                     
-                    if not df_sales.empty:
-                        st.markdown("**% of Sales**")
-                        # Merge on round
-                        merged = pd.merge(df_hist, df_sales, on="round", suffixes=("_item", "_sales"))
-                        merged["pct"] = merged["value_k_usd_item"] / merged["value_k_usd_sales"] * 100
-                        st.dataframe(merged[["round", "pct"]].set_index("round").style.format("{:.2f}%"))
+                    # Compare to Sales (if appropriate)
+                    if "Sales" not in selected_metric:
+                        # Fetch sales for same rounds
+                        df_sales = df_scope_specific[
+                            df_scope_specific['metric'].str.contains("Sales revenue")
+                        ]
+                        
+                        if not df_sales.empty:
+                            st.markdown("**% of Sales**")
+                            # Merge on round
+                            merged = pd.merge(df_hist, df_sales, on="round", suffixes=("_item", "_sales"))
+                            merged["pct"] = merged["value_k_usd_item"] / merged["value_k_usd_sales"] * 100
+                            st.dataframe(merged[["round", "pct"]].set_index("round").style.format("{:.2f}%"))
 
     # --- TAB: PREDICTION ---
     with tab_prediction:
@@ -462,67 +467,76 @@ def main():
         
         p_col1, p_col2, p_col3 = st.columns(3)
         
-        pred_metric = p_col1.selectbox("Metric to Forecast", all_metrics_available, key="pred_metric")
-        
-        # Auto-detect model recommendation
-        rec_model = "naive"
-        # Find statement type for better recommendation
-        stmt_series = df[df['metric'] == pred_metric]['statement_type']
-        stmt_type = stmt_series.iloc[0] if not stmt_series.empty else "Unknown"
-        rec_model = get_model_recommendation(pred_metric, stmt_type)
-        
-        model_options = ["naive", "moving_average", "linear_trend", "exp_smoothing", "drift"]
-        
-        # Set index of selectbox to the recommended one
-        default_idx = model_options.index(rec_model) if rec_model in model_options else 0
-        
-        selected_model = p_col2.selectbox(
-            f"Model (Recommended: {rec_model})", 
-            model_options, 
-            index=default_idx
-        )
-        
-        horizon = p_col3.slider("Forecast Horizon (Rounds)", 1, 5, 3)
-        
-        # Prepare Data
-        df_pred_hist = df[
+        # Filter metrics specifically for this tab as well
+        df_pred_scope = df[
             (df['team'] == selected_team) & 
-            (df['scope'] == selected_scope) & 
-            (df['metric'] == pred_metric)
-        ].set_index("round")["value_k_usd"].sort_index()
-        
-        if len(df_pred_hist) < 1:
-            st.warning("Not enough data to forecast.")
+            (df['scope'] == selected_scope)
+        ]
+        available_pred_metrics = sorted(df_pred_scope['metric'].unique())
+
+        if not available_pred_metrics:
+            st.warning(f"No metrics available to forecast for {selected_team} in {selected_scope}.")
         else:
-            hist_series, forecast_vals = forecast_series(df_pred_hist, selected_model, horizon)
+            pred_metric = p_col1.selectbox("Metric to Forecast", available_pred_metrics, key="pred_metric")
             
-            # Combine for Charting
-            # We construct a dataframe with index covering both history and future
-            all_indices = sorted(list(set(hist_series.index) | set(forecast_vals.index)))
-            chart_df = pd.DataFrame(index=all_indices)
-            chart_df["Historical"] = hist_series
-            chart_df["Forecast"] = forecast_vals
+            # Auto-detect model recommendation
+            rec_model = "naive"
+            # Find statement type for better recommendation
+            stmt_series = df[df['metric'] == pred_metric]['statement_type']
+            stmt_type = stmt_series.iloc[0] if not stmt_series.empty else "Unknown"
+            rec_model = get_model_recommendation(pred_metric, stmt_type)
             
-            st.subheader(f"Projection: {pred_metric}")
-            st.line_chart(chart_df)
+            model_options = ["naive", "moving_average", "linear_trend", "exp_smoothing", "drift"]
             
-            st.markdown("### Forecast Values")
+            # Set index of selectbox to the recommended one
+            default_idx = model_options.index(rec_model) if rec_model in model_options else 0
             
-            # Formatting forecast for display
-            disp_df = forecast_vals.to_frame(name="Forecast Value")
-            disp_df.index.name = "Round"
-            st.dataframe(disp_df.style.format("{:,.0f}"))
+            selected_model = p_col2.selectbox(
+                f"Model (Recommended: {rec_model})", 
+                model_options, 
+                index=default_idx
+            )
             
-            st.info(f"""
-            **Model Logic Used:**
-            * **{selected_model}**: {
-                "Assumes last value persists." if selected_model == 'naive' else
-                "Averages recent history." if selected_model == 'moving_average' else
-                "Fits a straight line trend." if selected_model == 'linear_trend' else
-                "Weighs recent data more heavily." if selected_model == 'exp_smoothing' else
-                "Projects the average historical change forward."
-            }
-            """)
+            horizon = p_col3.slider("Forecast Horizon (Rounds)", 1, 5, 3)
+            
+            # Prepare Data
+            df_pred_hist = df_pred_scope[
+                df_pred_scope['metric'] == pred_metric
+            ].set_index("round")["value_k_usd"].sort_index()
+            
+            # We now allow len >= 1 (even if it's just 1 point, we can do naive forecast)
+            if len(df_pred_hist) < 1:
+                st.warning("No data found to forecast (0 rows).")
+            else:
+                hist_series, forecast_vals = forecast_series(df_pred_hist, selected_model, horizon)
+                
+                # Combine for Charting
+                # We construct a dataframe with index covering both history and future
+                all_indices = sorted(list(set(hist_series.index) | set(forecast_vals.index)))
+                chart_df = pd.DataFrame(index=all_indices)
+                chart_df["Historical"] = hist_series
+                chart_df["Forecast"] = forecast_vals
+                
+                st.subheader(f"Projection: {pred_metric}")
+                st.line_chart(chart_df)
+                
+                st.markdown("### Forecast Values")
+                
+                # Formatting forecast for display
+                disp_df = forecast_vals.to_frame(name="Forecast Value")
+                disp_df.index.name = "Round"
+                st.dataframe(disp_df.style.format("{:,.0f}"))
+                
+                st.info(f"""
+                **Model Logic Used:**
+                * **{selected_model}**: {
+                    "Assumes last value persists." if selected_model == 'naive' else
+                    "Averages recent history." if selected_model == 'moving_average' else
+                    "Fits a straight line trend." if selected_model == 'linear_trend' else
+                    "Weighs recent data more heavily." if selected_model == 'exp_smoothing' else
+                    "Projects the average historical change forward."
+                }
+                """)
 
 if __name__ == "__main__":
     main()
